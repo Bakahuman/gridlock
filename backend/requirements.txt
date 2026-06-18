@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+httpx
+catboost
+scikit-learn
+pydantic
+python-multipart

@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+
+# Dev B adds the LocateAnything stack on the 3060 box:
+# torch
+# transformers
+# accelerate

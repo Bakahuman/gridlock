@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.env
+.env
+node_modules/
+dist/
+build/
+models/*.cbm
+models/*.pkl
+models/*.json
+*.log
+.DS_Store
+feedback_log.jsonl
+data/police_violations.csv
