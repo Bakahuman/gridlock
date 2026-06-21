@@ -55,6 +55,67 @@ def congestion_level(smoothed, free_max, moderate_max):
     return "CONGESTED", (0, 0, 255)
 
 
+def _clip_box(box, W, H):
+    return (max(0, int(box["x1"])), max(0, int(box["y1"])),
+            min(W, int(box["x2"])), min(H, int(box["y2"])))
+
+
+def _union(a, b):
+    return {"x1": min(a["x1"], b["x1"]), "y1": min(a["y1"], b["y1"]),
+            "x2": max(a["x2"], b["x2"]), "y2": max(a["y2"], b["y2"])}
+
+
+def _expand_down(box, factor, W, H):
+    w = box["x2"] - box["x1"]
+    h = box["y2"] - box["y1"]
+    return {"x1": box["x1"] - 0.5 * w, "y1": box["y1"],
+            "x2": box["x2"] + 0.5 * w, "y2": box["y2"] + factor * h}
+
+
+def _rider_below(head, dets):
+    # the vehicle a bare head sits on: horizontally overlapping and below it
+    hcy = (head["y1"] + head["y2"]) / 2
+    best, best_ox = None, 0.0
+    for d in dets:
+        if d["label"] not in ("motorcycle_rider", "person", "bicycle"):
+            continue
+        b = d["box"]
+        ox = min(head["x2"], b["x2"]) - max(head["x1"], b["x1"])
+        if ox <= 0 or (b["y1"] + b["y2"]) / 2 < hcy:
+            continue
+        if ox > best_ox:
+            best, best_ox = b, ox
+    return best
+
+
+def _evidence_crop(frame, event, all_dets):
+    """Crop the whole offending vehicle with the offending part highlighted."""
+    H, W = frame.shape[:2]
+    primary = event["detections"][0]["box"]  # head for no_helmet, vehicle for lane_block
+    if event["violation_type"] == "no_helmet":
+        veh = event.get("vehicle")
+        veh_box = veh["box"] if veh else _rider_below(primary, all_dets)
+        region = _union(primary, veh_box) if veh_box else _expand_down(primary, 5.0, W, H)
+        highlight = primary  # the un-helmeted head
+        label = "NO HELMET"
+    else:
+        veh = event.get("vehicle")
+        region = veh["box"] if veh else primary
+        highlight = region
+        label = event["violation_type"].replace("_", " ").upper()
+
+    x1, y1, x2, y2 = _clip_box(region, W, H)
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return None
+    crop = frame[y1:y2, x1:x2].copy()
+    hx1, hy1 = int(highlight["x1"]) - x1, int(highlight["y1"]) - y1
+    hx2, hy2 = int(highlight["x2"]) - x1, int(highlight["y2"]) - y1
+    cv2.rectangle(crop, (hx1, hy1), (hx2, hy2), (0, 0, 255), 2)
+    cv2.putText(crop, label, (max(0, hx1), max(12, hy1 - 4)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    return crop
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True)
@@ -212,17 +273,11 @@ def main():
             if args.emit:
                 for ev in evs:
                     rec = violation_record(ev, emit_cfg, vseq, source_frame=fi)
-                    ev_box = ev.get("vehicle") or (
-                        ev["detections"][0] if ev["detections"] else None)
-                    if ev_box:
-                        b = ev_box["box"]
-                        x1, y1 = max(0, int(b["x1"])), max(0, int(b["y1"]))
-                        x2, y2 = int(b["x2"]), int(b["y2"])
-                        crop = frame[y1:y2, x1:x2]
-                        if crop.size:
-                            ep = os.path.join(evidence_dir, rec["id"] + ".jpg")
-                            cv2.imwrite(ep, crop)
-                            rec["evidence_image_path"] = ep.replace(os.sep, "/")
+                    crop = _evidence_crop(frame, ev, dets)
+                    if crop is not None and crop.size:
+                        ep = os.path.join(evidence_dir, rec["id"] + ".jpg")
+                        cv2.imwrite(ep, crop)
+                        rec["evidence_image_path"] = ep.replace(os.sep, "/")
                     vio_writer.write(rec)
                     vseq += 1
 

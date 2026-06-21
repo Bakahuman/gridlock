@@ -244,7 +244,9 @@ class YoloDetector(Detector):
     _MODELS_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
 
     def __init__(self, model_id: str = None, device: str = "cuda"):
-        self.model_id = model_id or os.environ.get("YOLO_MODEL", "yolo11n.pt")
+        # yolo11m: better recall on small/dense vehicles than 11n, still GPU-fast.
+        # drop to yolo11s for more speed, or yolo11x for max accuracy, via YOLO_MODEL.
+        self.model_id = model_id or os.environ.get("YOLO_MODEL", "yolo11m.pt")
         self.device = device
         self.conf = float(os.environ.get("YOLO_CONF", "0.35"))
         # plates are small/cleaner after cropping, so allow a lower threshold
