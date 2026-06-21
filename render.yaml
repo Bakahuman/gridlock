@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: gridlock-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DETECTION_URL
+        fromService:
+          name: gridlock-detection
+          type: web
+          property: host
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11"
+
+  - type: web
+    name: gridlock-detection
+    runtime: python
+    rootDir: detection_service
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn service:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DETECTOR
+        value: mock
+      - key: PYTHON_VERSION
+        value: "3.11"
