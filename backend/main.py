@@ -18,6 +18,11 @@ import feedback
 DETECTION_URL = os.environ.get("DETECTION_URL", "http://localhost:8001")
 DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 
+# Supabase — optional, only used when env vars are set
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+VIOLATIONS_TABLE = "police_violations"
+
 app = FastAPI(title="Gridlock Backend")
 app.add_middleware(
     CORSMiddleware,
@@ -29,6 +34,13 @@ app.add_middleware(
 forecaster = None
 violation_data = []
 violation_meta = {}
+
+
+def get_supabase():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    from supabase import create_client
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def parse_violation_types(raw):
@@ -43,64 +55,112 @@ def parse_violation_types(raw):
     return types
 
 
-def load_violation_data():
-    global violation_data, violation_meta
-    path = os.path.join(DATA, "police_violations.csv")
-    if not os.path.exists(path):
-        print(f"PS1 data not found at {path}")
-        return
+def _row_from_record(row: dict) -> Optional[dict]:
+    try:
+        lat = float(row["latitude"])
+        lng = float(row["longitude"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not (12.7 <= lat <= 13.3 and 77.3 <= lng <= 77.9):
+        return None
 
-    rows = []
+    vtypes = parse_violation_types(row.get("violation_type", ""))
+    vtype = vtypes[0] if vtypes else "UNKNOWN"
+    vehicle = (row.get("vehicle_type") or "UNKNOWN").strip()
+    station = (row.get("police_station") or "UNKNOWN").strip()
+    junction = (row.get("junction_name") or "No Junction").strip()
+
+    hour = -1
+    dt_str = row.get("created_datetime", "")
+    if dt_str:
+        try:
+            hour = int(str(dt_str)[11:13])
+        except (ValueError, IndexError):
+            pass
+
+    return {
+        "lat": lat,
+        "lng": lng,
+        "vtype": vtype,
+        "vehicle": vehicle,
+        "station": station,
+        "junction": junction,
+        "hour": hour,
+    }
+
+
+def _build_meta(rows):
     vtype_counts = defaultdict(int)
     vehicle_counts = defaultdict(int)
     station_counts = defaultdict(int)
-
-    with open(path, encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            try:
-                lat = float(row["latitude"])
-                lng = float(row["longitude"])
-            except (ValueError, KeyError):
-                continue
-            if not (12.7 <= lat <= 13.3 and 77.3 <= lng <= 77.9):
-                continue
-
-            vtypes = parse_violation_types(row.get("violation_type", ""))
-            vtype = vtypes[0] if vtypes else "UNKNOWN"
-            vehicle = row.get("vehicle_type", "UNKNOWN").strip()
-            station = row.get("police_station", "UNKNOWN").strip()
-            junction = row.get("junction_name", "No Junction").strip()
-
-            hour = -1
-            dt_str = row.get("created_datetime", "")
-            if dt_str:
-                try:
-                    hour = int(dt_str[11:13])
-                except (ValueError, IndexError):
-                    pass
-
-            rows.append({
-                "lat": lat,
-                "lng": lng,
-                "vtype": vtype,
-                "vehicle": vehicle,
-                "station": station,
-                "junction": junction,
-                "hour": hour,
-            })
-            vtype_counts[vtype] += 1
-            vehicle_counts[vehicle] += 1
-            station_counts[station] += 1
-
-    violation_data = rows
-    violation_meta = {
+    for r in rows:
+        vtype_counts[r["vtype"]] += 1
+        vehicle_counts[r["vehicle"]] += 1
+        station_counts[r["station"]] += 1
+    return {
         "total": len(rows),
         "violation_types": sorted(vtype_counts.items(), key=lambda x: -x[1]),
         "vehicle_types": sorted(vehicle_counts.items(), key=lambda x: -x[1]),
         "police_stations": sorted(station_counts.items(), key=lambda x: -x[1]),
     }
-    print(f"loaded {len(rows)} violation records for heatmap")
+
+
+def load_violation_data_supabase():
+    global violation_data, violation_meta
+    sb = get_supabase()
+    if sb is None:
+        return False
+
+    print("Loading violations from Supabase...")
+    rows = []
+    # Supabase REST paginates at 1000 rows; page through all records
+    page_size = 1000
+    offset = 0
+    while True:
+        resp = (
+            sb.table(VIOLATIONS_TABLE)
+            .select("latitude,longitude,violation_type,vehicle_type,police_station,junction_name,created_datetime")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        batch = resp.data or []
+        for rec in batch:
+            r = _row_from_record(rec)
+            if r:
+                rows.append(r)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+
+    violation_data = rows
+    violation_meta = _build_meta(rows)
+    print(f"Loaded {len(rows)} violation records from Supabase")
+    return True
+
+
+def load_violation_data_csv():
+    global violation_data, violation_meta
+    path = os.path.join(DATA, "police_violations.csv")
+    if not os.path.exists(path):
+        print(f"CSV not found at {path}")
+        return
+
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            r = _row_from_record(row)
+            if r:
+                rows.append(r)
+
+    violation_data = rows
+    violation_meta = _build_meta(rows)
+    print(f"Loaded {len(rows)} violation records from CSV")
+
+
+def load_violation_data():
+    if not load_violation_data_supabase():
+        load_violation_data_csv()
 
 
 @app.on_event("startup")
@@ -119,7 +179,64 @@ def health():
         "ok": True,
         "forecaster_loaded": forecaster is not None,
         "violation_records": len(violation_data),
+        "data_source": "supabase" if (SUPABASE_URL and SUPABASE_KEY) else "csv",
     }
+
+
+@app.post("/upload/violations")
+async def upload_violations(file: UploadFile = File(...)):
+    """Upload a police_violations CSV and persist all rows to Supabase."""
+    sb = get_supabase()
+    if sb is None:
+        raise HTTPException(503, "Supabase not configured — set SUPABASE_URL and SUPABASE_KEY")
+
+    content = await file.read()
+    reader = csv.DictReader(io.StringIO(content.decode("utf-8")))
+
+    BATCH = 500
+    batch = []
+    inserted = 0
+    skipped = 0
+
+    for row in reader:
+        try:
+            lat = float(row.get("latitude", ""))
+            lng = float(row.get("longitude", ""))
+        except ValueError:
+            skipped += 1
+            continue
+
+        record = {
+            "id": row.get("id") or str(uuid.uuid4()),
+            "latitude": lat,
+            "longitude": lng,
+            "location": row.get("location"),
+            "vehicle_number": row.get("vehicle_number"),
+            "vehicle_type": row.get("vehicle_type"),
+            "description": row.get("description"),
+            "violation_type": row.get("violation_type"),
+            "offence_code": row.get("offence_code"),
+            "created_datetime": row.get("created_datetime") or None,
+            "closed_datetime": row.get("closed_datetime") or None,
+            "police_station": row.get("police_station"),
+            "junction_name": row.get("junction_name"),
+            "validation_status": row.get("validation_status"),
+        }
+        batch.append(record)
+
+        if len(batch) >= BATCH:
+            sb.table(VIOLATIONS_TABLE).upsert(batch, on_conflict="id").execute()
+            inserted += len(batch)
+            batch = []
+
+    if batch:
+        sb.table(VIOLATIONS_TABLE).upsert(batch, on_conflict="id").execute()
+        inserted += len(batch)
+
+    # Reload in-memory data from the newly populated table
+    load_violation_data_supabase()
+
+    return {"inserted": inserted, "skipped": skipped, "total_in_memory": len(violation_data)}
 
 
 @app.post("/analyze")
@@ -218,7 +335,6 @@ def hotspots(
 
     grid = defaultdict(int)
     for r in filtered:
-        # ~300m grid cells for smooth coverage
         key = (round(r["lat"] / 0.003) * 0.003, round(r["lng"] / 0.003) * 0.003)
         grid[key] += 1
 

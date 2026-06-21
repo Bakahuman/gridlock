@@ -5,3 +5,4 @@ catboost
 scikit-learn
 pydantic
 python-multipart
+supabase
