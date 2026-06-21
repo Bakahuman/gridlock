@@ -47,6 +47,18 @@ def _extend_down(box, factor):
     }
 
 
+def _extend_up(box, factor):
+    # grow a box upward -- riders' heads sit above their motorcycle
+    w = box["x2"] - box["x1"]
+    h = box["y2"] - box["y1"]
+    return {
+        "x1": box["x1"] - 0.1 * w,
+        "y1": box["y1"] - factor * h,
+        "x2": box["x2"] + 0.1 * w,
+        "y2": box["y2"],
+    }
+
+
 def _enclosing(inner_box, candidates):
     # the candidate whose box contains inner_box's center, with most overlap
     cx, cy = _center(inner_box)
@@ -83,6 +95,8 @@ def build_events(detections, no_parking_zone=None, context=None):
     riders = [d for d in detections if d["label"] in RIDER_LABELS]
     plates = [d for d in detections if d["label"] == "license_plate"]
     bare_heads = [d for d in detections if d["label"] == "no_helmet"]
+    motorcycles = [d for d in detections if d["label"] == "motorcycle_rider"]
+    heads = [d for d in detections if d["label"] in ("helmet", "no_helmet")]
 
     # lane block: a vehicle sitting inside the no-parking zone. read the plate
     # contained within that vehicle (extended down to catch a low-mounted plate).
@@ -108,6 +122,18 @@ def build_events(detections, no_parking_zone=None, context=None):
         events.append(
             _event("no_helmet", head["confidence"], head, plate, context, vehicle=rider)
         )
+
+    # triple riding: 3+ occupants on one motorcycle. heads (helmeted or not)
+    # are a reliable occupant proxy and are available in both the API and video
+    # paths, so we count heads sitting in the region above each motorcycle.
+    for m in motorcycles:
+        region = _extend_up(m["box"], 1.5)
+        occupants = [h for h in heads if _point_in(region, *_center(h["box"]))]
+        if len(occupants) >= 3:
+            plate = _plate_for(_extend_down(m["box"], 0.3), plates)
+            ev = _event("triple_riding", m["confidence"], m, plate, context, vehicle=m)
+            ev["detections"].extend(occupants)  # the heads backing the count
+            events.append(ev)
 
     return events
 

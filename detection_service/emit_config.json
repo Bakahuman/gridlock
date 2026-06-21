@@ -11,7 +11,8 @@
   "junction_name": "No Junction",
   "violation_map": {
     "no_helmet": {"label": "RIDING WITHOUT HELMET", "offence_code": null},
-    "lane_block": {"label": "WRONG PARKING", "offence_code": 112}
+    "lane_block": {"label": "WRONG PARKING", "offence_code": 112},
+    "triple_riding": {"label": "TRIPLE RIDING", "offence_code": null}
   },
   "vehicle_type_map": {
     "car": "CAR",
