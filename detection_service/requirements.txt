@@ -10,4 +10,5 @@ pillow
 
 # YOLO baseline (DETECTOR=yolo) — fast, local, closed-vocabulary:
 # ultralytics
-# easyocr        # optional: license-plate OCR for YoloDetector
+# omegaconf      # required by the bundled license_plate_detector.pt
+# easyocr        # license-plate OCR for YoloDetector

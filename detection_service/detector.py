@@ -247,9 +247,11 @@ class YoloDetector(Detector):
         self.model_id = model_id or os.environ.get("YOLO_MODEL", "yolo11n.pt")
         self.device = device
         self.conf = float(os.environ.get("YOLO_CONF", "0.35"))
+        # plates are small/cleaner after cropping, so allow a lower threshold
+        self.plate_conf = float(os.environ.get("YOLO_PLATE_CONF", "0.25"))
         # add-on models: env var wins, else fall back to the bundled weights if present
         self.helmet_model_id = os.environ.get("YOLO_HELMET_MODEL") or self._bundled("helmet_best.pt")
-        self.plate_model_id = os.environ.get("YOLO_PLATE_MODEL")  # plate flow wired next
+        self.plate_model_id = os.environ.get("YOLO_PLATE_MODEL") or self._bundled("plate_mkgoud.pt")
         self.model = None
         self.helmet_model = None
         self.plate_model = None
@@ -271,9 +273,12 @@ class YoloDetector(Detector):
             self.plate_model = YOLO(self.plate_model_id)
         # EasyOCR is loaded lazily on the first plate crop
 
-    def _infer(self, model, image, label_map=None) -> list[dict]:
+    def _infer(self, model, image, label_map=None, conf=None) -> list[dict]:
         results = model.predict(
-            image, conf=self.conf, device=self.device, verbose=False
+            image,
+            conf=self.conf if conf is None else conf,
+            device=self.device,
+            verbose=False,
         )
         dets = []
         for r in results:
@@ -319,6 +324,21 @@ class YoloDetector(Detector):
             return "no_helmet"
         return l
 
+    # Indian plate shape: 2 state letters, 1-2 RTO digits, 1-3 series letters,
+    # 4 running digits (e.g. KA01AB1234). used to pull the plate out of noisy OCR.
+    _PLATE_RE = re.compile(r"[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{3,4}")
+
+    @classmethod
+    def _clean_plate_text(cls, text: str) -> str | None:
+        if not text:
+            return None
+        compact = re.sub(r"[^A-Z0-9]", "", text.upper())
+        if not compact:
+            return None
+        m = cls._PLATE_RE.search(compact)
+        # return the well-formed plate if found, else the raw compact reading
+        return m.group(0) if m else compact
+
     def _read_plate(self, image, box) -> str | None:
         if self._ocr is None:
             try:
@@ -334,9 +354,93 @@ class YoloDetector(Detector):
         crop = image.crop(
             (int(box["x1"]), int(box["y1"]), int(box["x2"]), int(box["y2"]))
         )
-        texts = self._ocr.readtext(np.array(crop), detail=0)
-        joined = "".join(texts).upper().replace(" ", "")
-        return joined or None
+        # plate crops off a wide frame are tiny; EasyOCR reads them far better
+        # when upscaled so the text is ~100px tall (capped to avoid huge inputs)
+        w, h = crop.size
+        if 0 < h < 100:
+            s = min(100.0 / h, 6.0)
+            crop = crop.resize((max(1, int(w * s)), max(1, int(h * s))), Image.LANCZOS)
+        # constrain OCR to plate characters to cut spurious symbols
+        texts = self._ocr.readtext(
+            np.array(crop),
+            detail=0,
+            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        )
+        return self._clean_plate_text(" ".join(texts))
+
+    # vehicles/riders that carry a plate; we zoom into each to find small plates
+    _PLATE_REGION_LABELS = {"car", "bus", "truck", "motorcycle_rider", "bicycle"}
+
+    @staticmethod
+    def _iou(a, b) -> float:
+        x1 = max(a["x1"], b["x1"])
+        y1 = max(a["y1"], b["y1"])
+        x2 = min(a["x2"], b["x2"])
+        y2 = min(a["y2"], b["y2"])
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        inter = (x2 - x1) * (y2 - y1)
+        aa = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"])
+        bb = (b["x2"] - b["x1"]) * (b["y2"] - b["y1"])
+        return inter / (aa + bb - inter + 1e-6)
+
+    def _detect_plates(self, image, base_dets) -> list[dict]:
+        """Find plates by zooming into each vehicle/rider region.
+
+        The plate model is fed the whole image (catches large foreground plates)
+        AND each vehicle/rider crop. Cropping matters: the model resizes its
+        input to ~640px internally, so a plate that is a few pixels in the full
+        frame becomes detectable once isolated in a crop. Boxes from crops are
+        mapped back to full-image coordinates, then deduplicated.
+        """
+        W, H = image.size
+
+        # collect (box, conf) candidates from the full frame + every region crop
+        candidates = [
+            (p["box"], p["confidence"])
+            for p in self._infer(self.plate_model, image, conf=self.plate_conf)
+        ]
+        for d in base_dets:
+            if d["label"] not in self._PLATE_REGION_LABELS:
+                continue
+            box = d["box"]
+            pad_x = (box["x2"] - box["x1"]) * 0.10
+            pad_y = (box["y2"] - box["y1"]) * 0.15
+            cx1, cy1 = max(0, int(box["x1"] - pad_x)), max(0, int(box["y1"] - pad_y))
+            cx2, cy2 = min(W, int(box["x2"] + pad_x)), min(H, int(box["y2"] + pad_y))
+            if cx2 - cx1 < 16 or cy2 - cy1 < 16:
+                continue
+            crop = image.crop((cx1, cy1, cx2, cy2))
+            for p in self._infer(self.plate_model, crop, conf=self.plate_conf):
+                b = p["box"]
+                candidates.append(
+                    (
+                        {
+                            "x1": b["x1"] + cx1,
+                            "y1": b["y1"] + cy1,
+                            "x2": b["x2"] + cx1,
+                            "y2": b["y2"] + cy1,
+                        },
+                        p["confidence"],
+                    )
+                )
+
+        # dedup overlapping plate boxes (regions overlap), keeping highest conf,
+        # then OCR each surviving plate once
+        candidates.sort(key=lambda t: t[1], reverse=True)
+        plates = []
+        for box, conf in candidates:
+            if any(self._iou(box, kept["box"]) > 0.4 for kept in plates):
+                continue
+            plates.append(
+                {
+                    "label": "license_plate",
+                    "confidence": conf,
+                    "box": box,
+                    "ocr_text": self._read_plate(image, box),
+                }
+            )
+        return plates
 
     def detect(self, image_bytes: bytes, prompts: list[str] = None) -> list[dict]:
         # prompts are ignored (YOLO is closed-vocabulary); kept for interface parity
@@ -350,10 +454,7 @@ class YoloDetector(Detector):
                 dets.append(h)
 
         if self.plate_model is not None:
-            for p in self._infer(self.plate_model, image):
-                p["label"] = "license_plate"
-                p["ocr_text"] = self._read_plate(image, p["box"])
-                dets.append(p)
+            dets.extend(self._detect_plates(image, dets))
 
         return dets
 
